@@ -1,0 +1,9 @@
+{
+  "name": "Reporte en Mapa",
+  "short_name": "Reporte Mapa",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#f3f5f6",
+  "theme_color": "#1d3b53",
+  "lang": "es"
+}

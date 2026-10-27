@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1d3b53">
+<link rel="manifest" href="manifest.webmanifest">
+<title>Reporte en Mapa</title>
+<link rel="stylesheet" href="lib/leaflet.css">
+<style>
+/* Layout: barra superior con acciones, mapa arriba, lista de fotos editable abajo. */
+:root {
+  --bg: #f3f5f6; --surface: #ffffff; --fg: #17232c; --muted: #5d6b75;
+  --line: #d6dde2; --accent: #1d3b53; --accent-fg: #ffffff; --warn: #b5560b;
+  --font: "Segoe UI", Roboto, system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #11181d; --surface: #1a242b; --fg: #e4eaee; --muted: #9aa8b2;
+    --line: #2c3a44; --accent: #7fb4dc; --accent-fg: #0d1a24; --warn: #f0a35e; color-scheme: dark }
+}
+* { box-sizing: border-box }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 var(--font) }
+header { position: sticky; top: 0; z-index: 1000; background: var(--accent); color: var(--accent-fg);
+  padding: 10px max(16px, env(safe-area-inset-right)) 10px max(16px, env(safe-area-inset-left));
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center }
+header h1 { font-size: 18px; margin: 0 auto 0 0 }
+main { padding: 16px max(16px, env(safe-area-inset-right)) 32px max(16px, env(safe-area-inset-left));
+  display: grid; gap: 16px; max-width: 1100px; margin: 0 auto }
+button, .btn { font: inherit; border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer;
+  background: var(--accent-fg); color: var(--accent); font-weight: 600 }
+button:disabled { opacity: .5; cursor: default }
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
+label.btn input { display: none }
+.meta { display: grid; gap: 8px; grid-template-columns: 1fr 1fr }
+.meta input { width: 100% }
+input, textarea, select { font: inherit; color: var(--fg); background: var(--surface);
+  border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; width: 100% }
+#map { height: 46vh; min-height: 260px; border-radius: 8px; border: 1px solid var(--line) }
+#status { color: var(--muted); font-size: 14px }
+#status.warn { color: var(--warn) }
+.empty { padding: 32px 16px; text-align: center; color: var(--muted); border: 2px dashed var(--line); border-radius: 8px }
+#list { display: grid; gap: 10px }
+.item { display: grid; grid-template-columns: 120px 1fr; gap: 12px; background: var(--surface);
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px }
+.item img { width: 120px; height: 90px; object-fit: cover; border-radius: 4px; cursor: pointer }
+.item .fields { display: grid; gap: 6px; min-width: 0 }
+.item .row { display: flex; gap: 6px; flex-wrap: wrap }
+.item .row > * { flex: 1 1 160px }
+.item small { color: var(--muted); font-variant-numeric: tabular-nums }
+.item.nogps { border-color: var(--warn) }
+.item.nogps small { color: var(--warn) }
+@media (max-width: 560px) {
+  .meta { grid-template-columns: 1fr }
+  .item { grid-template-columns: 1fr }
+  .item img { width: 100%; height: 180px }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Reporte en Mapa</h1>
+  <label class="btn" for="files">Agregar fotos<input id="files" type="file" accept="image/jpeg,image/heic,image/*" multiple></label>
+  <button id="export" disabled>Descargar KMZ</button>
+</header>
+<main>
+  <div class="meta">
+    <input id="title" placeholder="Título del reporte (ej. Vialidades zona Zaragoza)">
+    <input id="author" placeholder="Responsable">
+  </div>
+  <div id="status">Agrega fotos tomadas con la ubicación activada. Todo se procesa en tu dispositivo; nada se sube a internet.</div>
+  <div id="map"></div>
+  <div id="list"><div class="empty">Aún no hay fotos. Toca “Agregar fotos” para empezar.</div></div>
+</main>
+
+<script src="lib/leaflet.js"></script>
+<script src="lib/jszip.min.js"></script>
+<script src="lib/full.umd.js"></script>
+<script>
+const CATEGORIES = ["Sin clasificar", "Bache", "Encharcamiento", "Fuga de agua", "Grieta / hundimiento",
+  "Escombro / basura", "Señalización", "Alumbrado", "Banqueta", "Otro"];
+const MAX_SIDE = 1600;
+const photos = []; // {id, file, thumb, lat, lon, when, title, note, cat, marker}
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+const map = L.map("map").setView([23.6, -102.5], 5);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+  { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(map);
+let placing = null;
+map.on("click", e => {
+  if (!placing) return;
+  placing.lat = +e.latlng.lat.toFixed(6); placing.lon = +e.latlng.lng.toFixed(6);
+  placing = null; map.getContainer().style.cursor = ""; render();
+});
+
+function setStatus(msg, warn) { const s = $("#status"); s.textContent = msg; s.className = warn ? "warn" : ""; }
+
+async function resized(file, side) {
+  const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+  const k = Math.min(1, side / Math.max(bmp.width, bmp.height));
+  const c = document.createElement("canvas");
+  c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+  c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+  bmp.close?.();
+  return new Promise(r => c.toBlob(r, "image/jpeg", 0.82));
+}
+
+$("#files").addEventListener("change", async e => {
+  const files = [...e.target.files]; e.target.value = "";
+  let n = 0;
+  for (const file of files) {
+    setStatus(`Leyendo ${++n} de ${files.length}…`);
+    let gps = null, when = null;
+    try {
+      const x = await exifr.parse(file, { gps: true, exif: true, tiff: true });
+      if (x && isFinite(x.latitude)) gps = [+x.latitude.toFixed(6), +x.longitude.toFixed(6)];
+      when = x?.DateTimeOriginal || x?.CreateDate || null;
+    } catch {}
+    let thumb;
+    try { thumb = URL.createObjectURL(await resized(file, 400)); }
+    catch { setStatus(`No pude abrir ${file.name}. Si es HEIC, cámbialo a JPG en tu celular.`, true); continue; }
+    photos.push({ id: crypto.randomUUID(), file, thumb, lat: gps?.[0], lon: gps?.[1],
+      when: when ? new Date(when) : new Date(file.lastModified), title: "", note: "", cat: CATEGORIES[0] });
+  }
+  photos.sort((a, b) => a.when - b.when);
+  render(true);
+});
+
+function render(fit) {
+  photos.forEach(p => { p.marker?.remove(); p.marker = null; });
+  const bounds = [];
+  photos.forEach((p, i) => {
+    if (p.lat == null) return;
+    p.marker = L.marker([p.lat, p.lon]).addTo(map)
+      .bindPopup(`<b>${i + 1}. ${esc(p.title || p.cat)}</b><br><img src="${p.thumb}" width="200">`);
+    bounds.push([p.lat, p.lon]);
+  });
+  if (fit && bounds.length) map.fitBounds(bounds, { padding: [30, 30], maxZoom: 17 });
+
+  const list = $("#list");
+  if (!photos.length) { list.innerHTML = '<div class="empty">Aún no hay fotos. Toca “Agregar fotos” para empezar.</div>'; }
+  else list.innerHTML = photos.map((p, i) => `
+    <div class="item ${p.lat == null ? "nogps" : ""}" data-id="${p.id}">
+      <img src="${p.thumb}" alt="Foto ${i + 1}">
+      <div class="fields">
+        <div class="row">
+          <input data-k="title" value="${esc(p.title)}" placeholder="${i + 1}. Título (ej. Bache frente a Home Depot)">
+          <select data-k="cat">${CATEGORIES.map(c => `<option${c === p.cat ? " selected" : ""}>${c}</option>`).join("")}</select>
+        </div>
+        <textarea data-k="note" rows="2" placeholder="Notas">${esc(p.note)}</textarea>
+        <div class="row">
+          <small>${p.when.toLocaleString("es-MX")} · ${p.lat != null ? `${p.lat}, ${p.lon}` : "Sin ubicación: toca “Ubicar en mapa” y luego el punto en el mapa"}</small>
+          <button class="place" style="flex:0 0 auto">Ubicar en mapa</button>
+          <button class="del" style="flex:0 0 auto">Quitar</button>
+        </div>
+      </div>
+    </div>`).join("");
+
+  const ok = photos.filter(p => p.lat != null).length, miss = photos.length - ok;
+  $("#export").disabled = !ok;
+  if (photos.length) setStatus(`${photos.length} fotos, ${ok} con ubicación` + (miss ? `, ${miss} sin ubicación (no irán al KMZ hasta que las ubiques).` : "."), miss > 0);
+}
+
+$("#list").addEventListener("input", e => {
+  const k = e.target.dataset.k; if (!k) return;
+  const p = photos.find(p => p.id === e.target.closest(".item").dataset.id); p[k] = e.target.value;
+});
+$("#list").addEventListener("change", e => { if (e.target.dataset.k) render(); });
+$("#list").addEventListener("click", e => {
+  const item = e.target.closest(".item"); if (!item) return;
+  const p = photos.find(p => p.id === item.dataset.id);
+  if (e.target.classList.contains("del")) { photos.splice(photos.indexOf(p), 1); render(); }
+  else if (e.target.classList.contains("place")) {
+    placing = p; map.getContainer().style.cursor = "crosshair";
+    map.getContainer().scrollIntoView({ behavior: "smooth" });
+    setStatus("Toca en el mapa el lugar de la foto.");
+  } else if (e.target.tagName === "IMG" && p.marker) { map.setView(p.marker.getLatLng(), 18); p.marker.openPopup(); }
+});
+
+function pad(n) { return String(n).padStart(2, "0"); }
+function iso(d) { return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; }
+
+$("#export").addEventListener("click", async () => {
+  const btn = $("#export"); btn.disabled = true;
+  try {
+    const zip = new JSZip();
+    const groups = new Map();
+    const located = photos.filter(p => p.lat != null);
+    for (let i = 0; i < located.length; i++) {
+      setStatus(`Preparando foto ${i + 1} de ${located.length}…`);
+      const p = located[i], name = `files/foto_${pad(i + 1).padStart(3, "0")}.jpg`;
+      zip.file(name, await resized(p.file, MAX_SIDE));
+      const key = `${p.lat},${p.lon}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push({ ...p, name, n: i + 1 });
+    }
+    const marks = [...groups.values()].map(items => {
+      const { lat, lon } = items[0];
+      const body = items.map(p => `<p><b>${p.n}. ${esc(p.title || p.cat)}</b><br>${esc(p.cat)} · ${p.when.toLocaleString("es-MX")}<br>` +
+        `<img src="${p.name}" width="480"/>${p.note ? `<br>${esc(p.note)}` : ""}</p>`).join("");
+      const desc = `${body}<p>Coordenadas: ${lat}, ${lon}</p><p>` +
+        `<a href="https://www.google.com/maps/search/?api=1&amp;query=${lat},${lon}">Abrir en Google Maps</a> · ` +
+        `<a href="https://maps.apple.com/?ll=${lat},${lon}&amp;q=${encodeURIComponent(items[0].title || "Punto " + items[0].n)}">Abrir en Apple Maps</a></p>`;
+      const name = items.map(p => p.n).join(", ") + ". " + (items[0].title || items[0].cat);
+      return `<Placemark><name>${esc(name)}</name><TimeStamp><when>${iso(items[0].when)}</when></TimeStamp>` +
+        `<styleUrl>#foto</styleUrl><description><![CDATA[${desc}]]></description>` +
+        `<Point><coordinates>${lon},${lat},0</coordinates></Point></Placemark>`;
+    });
+    const title = $("#title").value.trim() || "Reporte fotográfico";
+    const author = $("#author").value.trim();
+    zip.file("doc.kml", `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>${esc(title)}</name>
+<description>${esc((author ? "Responsable: " + author + ". " : "") + located.length + " fotos.")}</description>
+<Style id="foto"><IconStyle><scale>1.1</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/camera.png</href></Icon></IconStyle></Style>
+${marks.join("\n")}
+</Document></kml>`);
+    setStatus("Comprimiendo…");
+    const blob = await zip.generateAsync({ type: "blob", mimeType: "application/vnd.google-earth.kmz" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = title.replace(/[^\p{L}\p{N} _-]/gu, "").trim().replace(/\s+/g, "_") + ".kmz";
+    document.body.appendChild(a); a.click(); a.remove();
+    setStatus(`Listo: ${located.length} fotos en ${groups.size} puntos (${(blob.size / 1048576).toFixed(1)} MB). Ábrelo con Google Earth.`);
+  } catch (err) {
+    setStatus("No se pudo generar el KMZ: " + err.message, true);
+  } finally { btn.disabled = false; }
+});
+</script>
+</body>
+</html>

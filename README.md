@@ -12,4 +12,6 @@ Abre la página publicada con GitHub Pages, o abre `index.html` en Chrome desde 
 
 `tools/make_kmz.py` genera el mismo KMZ desde la línea de comandos: `python3 tools/make_kmz.py salida.kmz fotos/*.jpg` (requiere Pillow).
 
-Bibliotecas incluidas en `lib/`: Leaflet 1.9.4, JSZip 3.10.1, exifr 7.1.3.
+También genera un PDF del reporte (portada con resumen por tipo de daño y dos fotos por página).
+
+Bibliotecas incluidas en `lib/`: Leaflet 1.9.4, JSZip 3.10.1, exifr 7.1.3, jsPDF 2.5.2.

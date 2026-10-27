@@ -61,6 +61,7 @@ input, textarea, select { font: inherit; color: var(--fg); background: var(--sur
   <h1>Reporte en Mapa</h1>
   <label class="btn" for="files">Agregar fotos<input id="files" type="file" accept="image/jpeg,image/heic,image/*" multiple></label>
   <button id="export" disabled>Descargar KMZ</button>
+  <button id="pdf" disabled>Descargar PDF</button>
 </header>
 <main>
   <div class="meta">
@@ -75,6 +76,7 @@ input, textarea, select { font: inherit; color: var(--fg); background: var(--sur
 <script src="lib/leaflet.js"></script>
 <script src="lib/jszip.min.js"></script>
 <script src="lib/full.umd.js"></script>
+<script src="lib/jspdf.umd.min.js"></script>
 <script>
 const CATEGORIES = ["Sin clasificar", "Bache", "Encharcamiento", "Fuga de agua", "Grieta / hundimiento",
   "Escombro / basura", "Señalización", "Alumbrado", "Banqueta", "Otro"];
@@ -158,6 +160,7 @@ function render(fit) {
 
   const ok = photos.filter(p => p.lat != null).length, miss = photos.length - ok;
   $("#export").disabled = !ok;
+  $("#pdf").disabled = !photos.length;
   if (photos.length) setStatus(`${photos.length} fotos, ${ok} con ubicación` + (miss ? `, ${miss} sin ubicación (no irán al KMZ hasta que las ubiques).` : "."), miss > 0);
 }
 
@@ -216,14 +219,89 @@ ${marks.join("\n")}
 </Document></kml>`);
     setStatus("Comprimiendo…");
     const blob = await zip.generateAsync({ type: "blob", mimeType: "application/vnd.google-earth.kmz" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = title.replace(/[^\p{L}\p{N} _-]/gu, "").trim().replace(/\s+/g, "_") + ".kmz";
-    document.body.appendChild(a); a.click(); a.remove();
+    download(blob, fileBase(title) + ".kmz");
     setStatus(`Listo: ${located.length} fotos en ${groups.size} puntos (${(blob.size / 1048576).toFixed(1)} MB). Ábrelo con Google Earth.`);
   } catch (err) {
     setStatus("No se pudo generar el KMZ: " + err.message, true);
   } finally { btn.disabled = false; }
+});
+
+function fileBase(title) { return title.replace(/[^\p{L}\p{N} _-]/gu, "").trim().replace(/\s+/g, "_") || "Reporte"; }
+function download(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+}
+function blobToDataURL(blob) {
+  return new Promise((ok, fail) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = fail; r.readAsDataURL(blob); });
+}
+
+// Reporte PDF: portada con resumen por tipo de daño y una foto por página (carta).
+$("#pdf").addEventListener("click", async () => {
+  const btn = $("#pdf"); btn.disabled = true;
+  try {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: "mm", format: "letter" });
+    const W = 215.9, M = 15, CW = W - 2 * M;
+    const title = $("#title").value.trim() || "Reporte fotográfico";
+    const author = $("#author").value.trim();
+    const counts = {};
+    photos.forEach(p => counts[p.cat] = (counts[p.cat] || 0) + 1);
+    const first = photos[0]?.when, last = photos[photos.length - 1]?.when;
+
+    doc.setFont("helvetica", "bold"); doc.setFontSize(20);
+    doc.text(doc.splitTextToSize(title, CW), M, 30);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(11);
+    let y = 45;
+    const line = t => { doc.text(t, M, y); y += 6.5; };
+    if (author) line("Responsable: " + author);
+    if (first) line(`Fecha: ${first.toLocaleString("es-MX")} a ${last.toLocaleString("es-MX")}`);
+    line(`Fotos: ${photos.length} (${photos.filter(p => p.lat != null).length} con ubicación)`);
+    y += 4; doc.setFont("helvetica", "bold"); line("Resumen por tipo de daño"); doc.setFont("helvetica", "normal");
+    Object.entries(counts).sort((a, b) => b[1] - a[1]).forEach(([c, n]) => line(`•  ${c}: ${n}`));
+    y += 4;
+    doc.setFontSize(9); doc.setTextColor(90);
+    doc.text("Cada página incluye un enlace para abrir la ubicación en Google Maps. El archivo KMZ del mismo reporte abre en Google Earth.", M, y, { maxWidth: CW });
+    doc.setTextColor(0);
+
+    // Dos fotos por página: cada una ocupa media hoja.
+    for (let i = 0; i < photos.length; i++) {
+      setStatus(`Preparando foto ${i + 1} de ${photos.length}…`);
+      const p = photos[i];
+      if (i % 2 === 0) doc.addPage();
+      const top = i % 2 === 0 ? 18 : 142;
+      doc.setFont("helvetica", "bold"); doc.setFontSize(12);
+      doc.text(doc.splitTextToSize(`${i + 1}. ${p.title || p.cat}`, CW)[0], M, top);
+      doc.setFont("helvetica", "normal"); doc.setFontSize(9);
+      doc.text(`${p.cat}  ·  ${p.when.toLocaleString("es-MX")}`, M, top + 5.5);
+      const img = await resized(p.file, 1400);
+      const bmp = await createImageBitmap(img);
+      const h = Math.min(88, CW * bmp.height / bmp.width), w = h * bmp.width / bmp.height;
+      bmp.close?.();
+      doc.addImage(await blobToDataURL(img), "JPEG", M + (CW - w) / 2, top + 9, w, h);
+      y = top + 9 + h + 6;
+      if (p.lat != null) {
+        doc.text(`Coordenadas: ${p.lat}, ${p.lon}`, M, y);
+        doc.setTextColor(29, 59, 83);
+        doc.textWithLink("Abrir en Google Maps", M + 80, y, { url: `https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lon}` });
+        doc.setTextColor(0);
+      } else doc.text("Sin ubicación registrada", M, y);
+      if (p.note) doc.text(doc.splitTextToSize("Notas: " + p.note, CW).slice(0, 2), M, y + 5);
+    }
+    const pages = doc.getNumberOfPages();
+    for (let n = 1; n <= pages; n++) {
+      doc.setPage(n); doc.setFontSize(8); doc.setTextColor(120);
+      doc.text(`${title} · página ${n} de ${pages}`, M, 270);
+      doc.setTextColor(0);
+    }
+    setStatus("Generando PDF…");
+    const blob = doc.output("blob");
+    download(blob, fileBase(title) + ".pdf");
+    setStatus(`Listo: PDF de ${pages} páginas (${(blob.size / 1048576).toFixed(1)} MB).`);
+  } catch (err) {
+    setStatus("No se pudo generar el PDF: " + err.message, true);
+  } finally { btn.disabled = !photos.length; }
 });
 </script>
 </body>
